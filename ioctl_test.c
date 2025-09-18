@@ -1,8 +1,10 @@
+//user side
+
 #include <stdio.h>
 #include <fcntl.h>
 #include <sys/ioctl.h>
 
-#define IOCTL_TEST _IOW(0, 6, struct ioctl_test_t)
+#define IOCTL_TEST _IOR(0, 6, struct ioctl_test_t)
 
 int main () {
 
