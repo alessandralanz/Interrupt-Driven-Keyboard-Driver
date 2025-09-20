@@ -14,7 +14,7 @@ MODULE_LICENSE("GPL");
 
 /* attribute structures */
 struct ioctl_test_t {
-  int field1; //why do I need this field?
+  //int field1; //don't need
   char character;
 };
 struct ioctl_test_t ioc = { .character = '\0' }; //initializing the struct 
@@ -28,11 +28,24 @@ static int pseudo_device_ioctl(struct inode *inode, struct file *file,
 //initialize wait queue
 DECLARE_WAIT_QUEUE_HEAD(wait_queue);
 
+//read only scancode to ASCII tables
+//read only because we don't want them to be accidentally modified by kernel code
+static char keymap[128] = "\0\e1234567890-=\177\tqwertyuiop[]\n\0asdfghjkl;'\0\\zxcvbnm,./\0*\0 \0\0\0\0\0\0\0\0\0\0\0\0\000789-456+1230.\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"; 
+static char keymap_shift[128] = "\0\e!@#$%^&*()_+\177\tQWERTYUIOP{}\n\0ASDFGHJKL:\"~\0|ZXCVBNM<>?\0*\0 \0\0\0\0\0\0\0\0\0\0\0\0\000789-456+1230.\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
+
+//keyboard states
+//need a state for the right shift, left shift, ctrl
+static int right_shift = 0;
+static int left_shift = 0;
+static int left_control = 0;
+//need to define record mode, playback mode
+
+
 //interrupt handler (ISR) which is called automatically by the kernel whenver the device associated with irq generates an interrupt
 //limits the visibility of the function to the current file
 //int irq: interrupt number being handled
 //void *dev_id: pointer to a device specific identifier
-static irqreturn_t interrupt_handler(int irq, void *dev_id)
+static irqreturn_t interrupt_handler(int irq, void *dev_id);
 void my_printk(char *string);
 
 static struct file_operations pseudo_dev_proc_operations;
@@ -79,7 +92,6 @@ void my_printk(char *string)
   }
 } 
 
-
 static void __exit cleanup_routine(void) {
 
   printk("<1> Dumping module\n");
@@ -87,6 +99,82 @@ static void __exit cleanup_routine(void) {
   free_irq(1, &interrupt_handler);
 
   return;
+}
+
+//calls inline assmebly routine to read byte from I/O port address
+static inline unsigned char inb( unsigned short usPort ) {
+    unsigned char uch;
+   
+    asm volatile( "inb %1,%0" : "=a" (uch) : "Nd" (usPort) );
+    return uch;
+}
+
+//get scancode from the keyboard at data port 0x60
+//can read with inb
+unsigned char read_scancode(void){
+  unsigned char scancode = inb(0x60);
+  return scancode;
+}
+
+//convert the scancode to characters
+//returns ASCII char for scancode (0 if no printable char)
+static char translate_scancode(unsigned char scancode) {
+  //scan is the raw scancode byte from the keyboard
+  //& 0x7F clears the top bit giving us the base index to match our 128 entry lookup table 
+  unsigned int index = scancode & 0x7F; 
+  //if bit 7 of scan is set its a break (release)
+  //if bit 7 is clear its a make (press)
+  int make = !(scancode & 0x80); 
+  //ignore releases and only produce characters on press (so that we don't print twice)
+  if (!make) {
+    return 0;
+  }
+
+  if (left_shift || right_shift) {
+    return keymap_shift[index];
+  } else {
+    return keymap[index];
+  }
+}
+
+//keyboard interrupt handler
+static irqreturn_t interrupt_handler(int irq, void *dev_id){
+  //use the scancode we got from our read_scancode function and check the values
+  unsigned char scancode;
+  scancode = read_scancode();
+
+  //left shift
+  if (scancode == 0x2A) {
+    left_shift = 1;
+  } else if (scancode == 0xAA) {
+    left_shift = 0;
+  } 
+
+  //right shift
+  if (scancode == 0x36) {
+    right_shift = 1;
+  } else if (scancode == 0xB6) {
+    right_shift = 0;
+  }
+
+  //left control key
+  if (scancode == 0x1D) {
+    left_control = 1;
+    printk("control key pressed \n");
+  } else if (scancode == 0x9D) {
+    left_control = 0;
+  }
+
+  //record mode: left_control + r
+
+  //translate to ASCII
+  char ch = translate_scancode(scancode);
+  if (ch) {
+    ioc.character = ch; //store in global since we cannot directly return a value to user space (store to stash until user space asks for it)
+    wake_up_interruptible(&wait_queue); //wake up any sleeping readers when ISR stores a new character into ioc.character
+  }
+
+  return 0; //irq handled
 }
 
 
@@ -115,14 +203,6 @@ static int pseudo_device_ioctl(struct inode *inode, struct file *file,
 
     //need to reset ioc so that we do not continuously send the same character over and over unless it is being pressed
     ioc.character = '\0';
-
-    //why do we copy from user after the kernel receives it??
-    copy_from_user(&ioc, (struct ioctl_test_t *)arg, 
-		   sizeof(struct ioctl_test_t));
-    printk("<1> ioctl: call to IOCTL_TEST (%d,%c)!\n", 
-	   ioc.field1, ioc.field2);
-
-    my_printk ("Got msg in kernel\n");
     break;
   
   default:
