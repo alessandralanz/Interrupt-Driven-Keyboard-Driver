@@ -9,8 +9,17 @@
 #include <linux/sched.h>
 #include <linux/interrupt.h>
 #include <linux/wait.h>
+#include <linux/string.h>
+#include <linux/kmod.h>
 
 MODULE_LICENSE("GPL");
+
+//idk what this is
+static char *envp[] = {
+  "HOME/",
+  "PATH=/sbin:/bin:/usr/sbin:/usr/bin",
+  NULL
+};
 
 /* attribute structures */
 struct ioctl_test_t {
@@ -28,18 +37,6 @@ static int pseudo_device_ioctl(struct inode *inode, struct file *file,
 //initialize wait queue
 DECLARE_WAIT_QUEUE_HEAD(wait_queue);
 
-//read only scancode to ASCII tables
-//read only because we don't want them to be accidentally modified by kernel code
-static char keymap[128] = "\0\e1234567890-=\177\tqwertyuiop[]\n\0asdfghjkl;'\0\\zxcvbnm,./\0*\0 \0\0\0\0\0\0\0\0\0\0\0\0\000789-456+1230.\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"; 
-static char keymap_shift[128] = "\0\e!@#$%^&*()_+\177\tQWERTYUIOP{}\n\0ASDFGHJKL:\"~\0|ZXCVBNM<>?\0*\0 \0\0\0\0\0\0\0\0\0\0\0\0\000789-456+1230.\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
-
-//keyboard states
-//need a state for the right shift, left shift, ctrl
-static int right_shift = 0;
-static int left_shift = 0;
-static int left_control = 0;
-//need to define record mode, playback mode
-
 
 //interrupt handler (ISR) which is called automatically by the kernel whenver the device associated with irq generates an interrupt
 //limits the visibility of the function to the current file
@@ -49,10 +46,41 @@ static irqreturn_t interrupt_handler(int irq, void *dev_id);
 void my_printk(char *string);
 
 static struct file_operations pseudo_dev_proc_operations;
-
 static struct proc_dir_entry *proc_entry;
 
+//read only scancode to ASCII tables
+//don't want them to be accidentally modified by kernel code
+static const char keymap[128] = "\0\e1234567890-=\177\tqwertyuiop[]\n\0asdfghjkl;'\0\\zxcvbnm,./\0*\0 \0\0\0\0\0\0\0\0\0\0\0\0\000789-456+1230.\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"; 
+static const char keymap_shift[128] = "\0\e!@#$%^&*()_+\177\tQWERTYUIOP{}\n\0ASDFGHJKL:\"~\0|ZXCVBNM<>?\0*\0 \0\0\0\0\0\0\0\0\0\0\0\0\000789-456+1230.\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
+
+static in run_cmd(char *const argv[]){
+  //run user space helper and wait for it to finish
+  return call_usermodehelper(argv[0], argv, envp, UMH_WAIT_PROC);
+}
+
+//apparently this is a stable dev_id so that free_irq() matches request_irq()??
+static int kbd_dev_id;
+
+//keyboard states
+//need a state for the right shift, left shift, ctrl
+static int right_shift = 0;
+static int left_shift = 0;
+static int left_control = 0;
+static char record_buffer[1024];
+static int record_len = 0;
+static int record_mode = 0;
+static int playback_flat = 0;
+static int playback_reverse = 0;
+//preprocessor event tokens sent to user space through ioc.character
+#define RECORD '\x01'
+#define PLAYBACK '\x02'
+#define FLATTEN '\x03'
+#define REVERSE '\x04'
+
+
 static int __init initialization_routine(void) {
+  int ret;
+
   printk("<1> Loading module\n");
 
   pseudo_dev_proc_operations.ioctl = pseudo_device_ioctl;
@@ -68,12 +96,26 @@ static int __init initialization_routine(void) {
   //proc_entry->owner = THIS_MODULE; <-- This is now deprecated
   proc_entry->proc_fops = &pseudo_dev_proc_operations;
 
+  //unload stock keyboard modules so we can use our own IRQ1 exclusively
+  {
+    char *rmmod_atkbd[] = {"/sbin/rmmod", "atkbd", NULL};
+    char *rmmod_i8042[] = {"/sbin/rmmod", "i8042", NULL};
+
+    ret = run_cmd(rmmod_atkbd);
+    if (ret)
+      printk("<1> rmmod atkbd returned %d (ok if already gone)\n", ret);
+    ret = run_cmd(rmmod_i8042);
+    if (ret)
+      printk("<1> rmmod i8042 returned %d (ok if already gone)\n", ret);
+  }
+
   //registering the IRQ handler using the kernel API
   //need to initialize the keyboard interrupt by using interrupt_hander() function
-  //IRQF_SHARED flag tells kernel the IRQ can be shared (important bc IRQ1 could be in use by the stock keyboard driver (i8042))
-  //IRQ 1 = keyboard controller
-  if (request_irq(1, interrupt_handler, IRQF_SHARED, "keyboard_interrupt", &interrupt_handler)){
-    printk("<1> Cannot register IRQ 1 \n");
+  //request IRQ1 exclusively 
+  ret = request_irq(1, interrupt_handler, 0, "keyboard_interrupt", &kbd_dev_id);
+
+  if (ret){
+    printk("<1> request_irq(1) failed \n", ret);
     return -EINVAL; //invalid argument
   }
   return 0;
@@ -94,11 +136,26 @@ void my_printk(char *string)
 
 static void __exit cleanup_routine(void) {
 
-  printk("<1> Dumping module\n");
-  remove_proc_entry("ioctl_test", NULL);
-  free_irq(1, &interrupt_handler);
+  int ret;
 
-  return;
+  printk("<1> Dumping module\n");
+  //free IRQ1 first so stock driver can claim it
+  free_irq(1, &kbd_dev_id);
+
+  //restore stock keyboard modules
+  {
+    char *modprobe_i8042[] = {"/sbin/modprobe", "i8042", NULL};
+    char *modprobe_atkbd[] = {"/sbin/modprobe", "atkbd", NULL};
+
+    ret = run_cmd(modprobe_i8042);
+    if (ret)
+      printk("<1> modprobe i8042 returned %d\n", ret);
+    ret = run_cmd(modprobe_atkbd);
+    if (ret)
+      printk("<1> modprobe atkbd returned %d\n", ret);
+  }
+
+  remove_proc_entry("ioctl_test", NULL);
 }
 
 //calls inline assmebly routine to read byte from I/O port address
@@ -119,22 +176,22 @@ unsigned char read_scancode(void){
 //convert the scancode to characters
 //returns ASCII char for scancode (0 if no printable char)
 static char translate_scancode(unsigned char scancode) {
-  //scan is the raw scancode byte from the keyboard
-  //& 0x7F clears the top bit giving us the base index to match our 128 entry lookup table 
-  unsigned int index = scancode & 0x7F; 
-  //if bit 7 of scan is set its a break (release)
-  //if bit 7 is clear its a make (press)
-  int make = !(scancode & 0x80); 
   //ignore releases and only produce characters on press (so that we don't print twice)
-  if (!make) {
+  if (scancode & 0x80){
     return 0;
   }
 
-  if (left_shift || right_shift) {
-    return keymap_shift[index];
-  } else {
-    return keymap[index];
+  //`& 0x7F` clears the top bit giving us the base index to match our 128 entry lookup table 
+  unsigned int index = scancode & 0x7F; 
+
+  //backspace 
+  if (index == 0x0E){
+    return '\b'; //use this or return keymap[index]??
   }
+
+  char ch = (left_shift || right_shift) ? keymap_shift[index] : keymap[index];
+
+  return ch;
 }
 
 //keyboard interrupt handler
@@ -165,16 +222,102 @@ static irqreturn_t interrupt_handler(int irq, void *dev_id){
     left_control = 0;
   }
 
-  //record mode: left_control + r
+  if (left_control && (!(scancode & 0x80))){
+    //record mode: left_control + r
+    //check letter's scancode (0x13 for r) and ctrl state
+    if ((scancode & 0x7F) == 0x13){
+      if (!record_mode){
+        record_mode = 1;
+        record_len = 0;
+        playback_flat = 0;
+        playback_reverse = 0;
+        ioc.character = RECORD;
+        wake_up_interruptible(&wait_queue);
+      } 
+      return IRQ_HANDLED;
+    }
 
-  //translate to ASCII
-  char ch = translate_scancode(scancode);
-  if (ch) {
-    ioc.character = ch; //store in global since we cannot directly return a value to user space (store to stash until user space asks for it)
-    wake_up_interruptible(&wait_queue); //wake up any sleeping readers when ISR stores a new character into ioc.character
+    //Reverse and flatten: left_control + R after left_control + r
+    if (((scancode & 0x7F) == 0x13) && (left_shift || right_shift)){
+      //check if we are already recording
+      if (record_mode){
+        playback_flat = 1;
+        playback_reverse = 1;
+        ioc.character = REVERSE;
+        wake_up_interruptible(&wait_queue);
+      }
+      return IRQ_HANDLED;
+    }
+
+    //flatten playback: left_control + N
+    if ((scancode & 0x7F) == 0x31 && (left_shift || right_shift)){
+      if (record_mode){
+        playback_flat = 1;
+        ioc.character = FLATTEN;
+        wake_up_interruptible(&wait_queue);
+      }
+      return IRQ_HANDLED;
+    }
+
+    //playback: left_control + p 
+    //perform playback then clear state
+    if ((scancode & 0x7F) == 0x19){
+      if (record_mode){
+        int i;
+        ioc.character = PLAYBACK;
+        wake_up_interruptible(&wait_queue);
+
+        if (playback_reverse) {
+          for (i = record_len - 1; i >= 0; i--){
+            char out = record_buffer[i];
+            if (out == '\n') {
+              out = ' ';
+            }
+            ioc.character = out;
+            wake_up_interruptible(&wait_queue);
+          }
+        } else {
+          for (i = 0; i < record_len; ++i){
+            char out = record_buffer[i];
+            if (playback_flat && out == '\n') {
+              out = ' ';
+            }
+            ioc.character = out;
+            wake_up_interruptible(&wait_queue);
+          }
+        }
+        record_mode = 0;
+        record_len = 0;
+        playback_flat = 0;
+        playback_reverse = 0;
+      }
+      return IRQ_HANDLED;
+    }
   }
-
-  return 0; //irq handled
+  //translate to ASCII
+  if (!(scancode & 0x80)){
+    char ch = translate_scancode(scancode); //ignore breaks
+    //only continue if we have something to deliver or buffer from translate_scancode (0 means no printable char)
+    if (ch) {
+      //buffer only and save for playback
+      //we do not want to emit while recording
+      if (record_mode){
+        //skip backspace during recording? 
+        //idk instructions say to not worry about embedded modifier sequences
+        //prevent buffer overflow; if full drop extra chars
+        if (ch != '\b' && record_len < (int)sizeof(record_buffer)){
+          record_buffer[record_len++] = ch;
+        }
+      }
+      //normal emit
+      //not recording so keystrokes are delivered immediately to user space
+      else {
+        ioc.character = ch; //store in global since we cannot directly return a value to user space (store to stash until user space asks for it)
+        wake_up_interruptible(&wait_queue); //wake up any sleeping readers when ISR stores a new character into ioc.character
+      }
+    }
+  }
+  return IRQ_HANDLED; //irq handled
 }
 
 
@@ -185,7 +328,6 @@ static irqreturn_t interrupt_handler(int irq, void *dev_id){
 static int pseudo_device_ioctl(struct inode *inode, struct file *file,
 				unsigned int cmd, unsigned long arg)
 {
-  struct ioctl_test_t ioc;
   
   switch (cmd){
 
@@ -193,12 +335,11 @@ static int pseudo_device_ioctl(struct inode *inode, struct file *file,
     //wait until there is a new character
     //macro that puts a process to sleep until specification is met or we receive a signal
     //takes in a wait queue and a condition (not white space)
-    wait_event_interruptible(wait_queue, ioc.character != '\0');
-    if (ioc.character != '\0') {
+    int ret = wait_event_interruptible(wait_queue, ioc.character != '\0');
+    if (ret) {
       my_printk("Character received in kernel: ");
-      //copies 
       //takes in the destination address in user space, source address in kernel space, and # of bytes to copy
-      copy_to_user((struct ioctl_test_t *)arg, &ioc, sizeof(struct ioctl_test_t)) //explain?? the inputs
+      copy_to_user((struct ioctl_test_t *)arg, &ioc, sizeof(struct ioctl_test_t)); //explain?? the inputs
     }
 
     //need to reset ioc so that we do not continuously send the same character over and over unless it is being pressed
