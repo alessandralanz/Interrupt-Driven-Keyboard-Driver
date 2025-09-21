@@ -16,7 +16,7 @@ MODULE_LICENSE("GPL");
 
 //idk what this is
 static char *envp[] = {
-  "HOME/",
+  "HOME=/",
   "PATH=/sbin:/bin:/usr/sbin:/usr/bin",
   NULL
 };
@@ -53,7 +53,7 @@ static struct proc_dir_entry *proc_entry;
 static const char keymap[128] = "\0\e1234567890-=\177\tqwertyuiop[]\n\0asdfghjkl;'\0\\zxcvbnm,./\0*\0 \0\0\0\0\0\0\0\0\0\0\0\0\000789-456+1230.\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"; 
 static const char keymap_shift[128] = "\0\e!@#$%^&*()_+\177\tQWERTYUIOP{}\n\0ASDFGHJKL:\"~\0|ZXCVBNM<>?\0*\0 \0\0\0\0\0\0\0\0\0\0\0\0\000789-456+1230.\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
 
-static in run_cmd(char *const argv[]){
+static int run_cmd(char *const argv[]){
   //run user space helper and wait for it to finish
   return call_usermodehelper(argv[0], argv, envp, UMH_WAIT_PROC);
 }
@@ -115,7 +115,7 @@ static int __init initialization_routine(void) {
   ret = request_irq(1, interrupt_handler, 0, "keyboard_interrupt", &kbd_dev_id);
 
   if (ret){
-    printk("<1> request_irq(1) failed \n", ret);
+    printk("<1> request_irq(1) failed \n");
     return -EINVAL; //invalid argument
   }
   return 0;
@@ -331,7 +331,7 @@ static int pseudo_device_ioctl(struct inode *inode, struct file *file,
   
   switch (cmd){
 
-  case IOCTL_TEST:
+  case IOCTL_TEST: {
     //wait until there is a new character
     //macro that puts a process to sleep until specification is met or we receive a signal
     //takes in a wait queue and a condition (not white space)
@@ -345,6 +345,7 @@ static int pseudo_device_ioctl(struct inode *inode, struct file *file,
     //need to reset ioc so that we do not continuously send the same character over and over unless it is being pressed
     ioc.character = '\0';
     break;
+  }
   
   default:
     return -EINVAL;
