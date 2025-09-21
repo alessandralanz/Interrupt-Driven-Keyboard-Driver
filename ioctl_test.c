@@ -4,6 +4,7 @@
 #include <fcntl.h>
 #include <sys/ioctl.h>
 #include <stdlib.h>
+#include <unistd.h>
 
 /* attribute structures */
 struct ioctl_test_t {

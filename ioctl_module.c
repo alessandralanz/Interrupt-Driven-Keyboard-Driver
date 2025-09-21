@@ -53,7 +53,7 @@ static struct proc_dir_entry *proc_entry;
 static const char keymap[128] = "\0\e1234567890-=\177\tqwertyuiop[]\n\0asdfghjkl;'\0\\zxcvbnm,./\0*\0 \0\0\0\0\0\0\0\0\0\0\0\0\000789-456+1230.\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"; 
 static const char keymap_shift[128] = "\0\e!@#$%^&*()_+\177\tQWERTYUIOP{}\n\0ASDFGHJKL:\"~\0|ZXCVBNM<>?\0*\0 \0\0\0\0\0\0\0\0\0\0\0\0\000789-456+1230.\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
 
-static int run_cmd(char *const argv[]){
+static int run_cmd(char **argv){
   //run user space helper and wait for it to finish
   return call_usermodehelper(argv[0], argv, envp, UMH_WAIT_PROC);
 }
@@ -112,11 +112,11 @@ static int __init initialization_routine(void) {
   //registering the IRQ handler using the kernel API
   //need to initialize the keyboard interrupt by using interrupt_hander() function
   //request IRQ1 exclusively 
-  ret = request_irq(1, interrupt_handler, 0, "keyboard_interrupt", &kbd_dev_id);
+  ret = request_irq(1, interrupt_handler, IRQF_SHARED, "keyboard_interrupt", &kbd_dev_id);
 
   if (ret){
-    printk("<1> request_irq(1) failed \n");
-    return -EINVAL; //invalid argument
+    printk("<1> request_irq(1) failed %d\n", ret);
+    return ret; //invalid argument
   }
   return 0;
 }
@@ -176,20 +176,23 @@ unsigned char read_scancode(void){
 //convert the scancode to characters
 //returns ASCII char for scancode (0 if no printable char)
 static char translate_scancode(unsigned char scancode) {
+  unsigned int index;
+  char ch;
+  
   //ignore releases and only produce characters on press (so that we don't print twice)
   if (scancode & 0x80){
     return 0;
   }
 
   //`& 0x7F` clears the top bit giving us the base index to match our 128 entry lookup table 
-  unsigned int index = scancode & 0x7F; 
+  index = scancode & 0x7F; 
 
   //backspace 
   if (index == 0x0E){
     return '\b'; //use this or return keymap[index]??
   }
 
-  char ch = (left_shift || right_shift) ? keymap_shift[index] : keymap[index];
+  ch = (left_shift || right_shift) ? keymap_shift[index] : keymap[index];
 
   return ch;
 }
@@ -332,14 +335,17 @@ static int pseudo_device_ioctl(struct inode *inode, struct file *file,
   switch (cmd){
 
   case IOCTL_TEST: {
+    int ret;
     //wait until there is a new character
     //macro that puts a process to sleep until specification is met or we receive a signal
     //takes in a wait queue and a condition (not white space)
-    int ret = wait_event_interruptible(wait_queue, ioc.character != '\0');
+    ret = wait_event_interruptible(wait_queue, ioc.character != '\0');
     if (ret) {
-      my_printk("Character received in kernel: ");
-      //takes in the destination address in user space, source address in kernel space, and # of bytes to copy
-      copy_to_user((struct ioctl_test_t *)arg, &ioc, sizeof(struct ioctl_test_t)); //explain?? the inputs
+     return ret;
+    }
+
+    if (copy_to_user((struct ioctl_test_t __user *)arg, &ioc, sizeof(ioc))){
+      return -EFAULT;
     }
 
     //need to reset ioc so that we do not continuously send the same character over and over unless it is being pressed
