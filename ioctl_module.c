@@ -11,6 +11,9 @@
 #include <linux/wait.h>
 #include <linux/string.h>
 #include <linux/kmod.h>
+#include <linux/irq.h>
+#include <linux/kprobes.h>
+#include <linux/spinlock.h>
 
 MODULE_LICENSE("GPL");
 
@@ -47,6 +50,19 @@ static const char keymap_shift[128] = "\0\e!@#$%^&*()_+\177\tQWERTYUIOP{}\n\0ASD
 //apparently this is a stable dev_id so that free_irq() matches request_irq()??
 static int kbd_dev_id;
 
+struct irq_desc;
+struct irqaction;
+static struct irq_desc *(*p_irq_to_desc)(unsigned int);
+//keeping what we overwrite so we can restore it
+static struct irq_desc *kbd_desc;
+static struct irqaction *kbd_act;
+static irq_handler_t saved_handler;
+static void *saved_dev_id;
+static const char *saved_name;
+static int hijacked;
+static int kbd_dev_id;
+
+
 //keyboard states
 //need a state for the right shift, left shift, ctrl
 static int right_shift = 0;
@@ -66,6 +82,11 @@ static int playback_reverse = 0;
 
 static int __init initialization_routine(void) {
   int ret;
+  unsigned long flags;
+  struct irqaction *act;
+  struct kprobe kp = {
+    .symbol_name = "irq_to_desc",
+  };
 
   printk(KERN_INFO, "<1> Loading module\n");
 
@@ -82,15 +103,61 @@ static int __init initialization_routine(void) {
   //proc_entry->owner = THIS_MODULE; <-- This is now deprecated
   proc_entry->proc_fops = &pseudo_dev_proc_operations;
 
-  //claim IRQ1 (try exclusive; fall back to shared if needed)
-  ret = request_irq(1, interrupt_handler, IRQF_SHARED, "ioctl_kbd", &kbd_dev_id);
+  //use kprobe for irq_to_desc
+  ret = register_kprobe(&kp);
   if (ret) {
-    printk(KERN_ERR "ioctl_module: request_irq(1) shared failed (%d)\n", ret);
+    printk(KERN_ERR "ioctl_module: kprobe resolve irq_to_desc failed: %d\n", ret);
     remove_proc_entry("ioctl_test", NULL);
-    return ret;
+    return -ENOENT;
   }
-  printk(KERN_INFO "ioctl_module: hooked IRQ1 as shared (ioctl_kbd)\n");
+  p_irq_to_desc = (void *)kp.addr;
+  unregister_kprobe(&kp);
 
+  if (!p_irq_to_desc) {
+    printk(KERN_ERR "ioctl_module: irq_to_desc address null\n");
+    remove_proc_entry("ioctl_test", NULL);
+    return -ENOENT;
+  }
+
+  //get IRQ1 descriptor
+  kbd_desc = p_irq_to_desc(1);
+  if (!kbd_desc) {
+    printk(KERN_ERR "ioctl_module: irq_to_desc(1) -> NULL\n");
+    remove_proc_entry("ioctl_test", NULL);
+    return -ENODEV;
+  }
+
+  //find i8042 action on IRQ1
+  act = kbd_desc->action;
+  while (act && (!act->name || !(strstr(act->name, "i8042")))) {
+    act = act->next;
+  }
+  if (!act) {
+    //if there’s only one hijack that
+    act = kbd_desc->action;
+    if (!act) {
+      printk(KERN_ERR "ioctl_module: no irqaction on IRQ1\n");
+      remove_proc_entry("ioctl_test", NULL);
+      return -ENODEV;
+    }
+    printk(KERN_WARNING "ioctl_module: i8042 action not found; hijacking first action named '%s'\n", act->name ? act->name : "(null)");
+  }
+
+  //swap the handler under the desc lock
+  raw_spin_lock_irqsave(&kbd_desc->lock, flags);
+
+  kbd_act = act;
+  saved_handler = act->handler;
+  saved_dev_id = act->dev_id;
+  saved_name = act->name;
+
+  act->handler = interrupt_handler;
+  act->dev_id = &kbd_dev_id;
+  act->name = "ioctl_kbd";
+  hijacked = 1;
+  raw_spin_unlock_irqrestore(&kbd_desc->lock, flags);
+
+  printk(KERN_INFO "ioctl_module: hijacked IRQ1 from '%s'\n", saved_name ? saved_name : "(null)");
   return 0;
 }
 
@@ -108,9 +175,17 @@ void my_printk(char *string)
 } 
 
 static void __exit cleanup_routine(void) {
-  printk("<1> Dumping module\n");
-  //free IRQ1 first so stock driver can claim it
-  free_irq(1, &kbd_dev_id);
+  unsigned long flags;
+
+  if (hijacked && kbd_desc && kbd_act) {
+    raw_spin_lock_irqsave(&kbd_desc->lock, flags);
+    kbd_act->handler = saved_handler;
+    kbd_act->dev_id = saved_dev_id;
+    kbd_act->name = saved_name;
+    hijacked = 0;
+    raw_spin_unlock_irqrestore(&kbd_desc->lock, flags);
+    printk(KERN_INFO "ioctl_module: restored IRQ1 action '%s'\n", saved_name ? saved_name : "(null)");
+  }
   remove_proc_entry("ioctl_test", NULL);
 }
 
@@ -184,7 +259,6 @@ static irqreturn_t interrupt_handler(int irq, void *dev_id){
   //left control key
   if (scancode == 0x1D) {
     left_control = 1;
-    printk("control key pressed \n");
   } else if (scancode == 0x9D) {
     left_control = 0;
   }
