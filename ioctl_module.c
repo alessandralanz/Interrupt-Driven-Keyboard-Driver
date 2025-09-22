@@ -14,13 +14,6 @@
 
 MODULE_LICENSE("GPL");
 
-//idk what this is
-static char *envp[] = {
-  "HOME=/",
-  "PATH=/sbin:/bin:/usr/sbin:/usr/bin",
-  NULL
-};
-
 /* attribute structures */
 struct ioctl_test_t {
   //int field1; //don't need
@@ -33,10 +26,11 @@ struct ioctl_test_t ioc = { .character = '\0' }; //initializing the struct
 //function declarations 
 static int pseudo_device_ioctl(struct inode *inode, struct file *file,
 			       unsigned int cmd, unsigned long arg);
+static struct file_operations pseudo_dev_proc_operations;
+static struct proc_dir_entry *proc_entry;
 
 //initialize wait queue
 DECLARE_WAIT_QUEUE_HEAD(wait_queue);
-
 
 //interrupt handler (ISR) which is called automatically by the kernel whenver the device associated with irq generates an interrupt
 //limits the visibility of the function to the current file
@@ -45,18 +39,10 @@ DECLARE_WAIT_QUEUE_HEAD(wait_queue);
 static irqreturn_t interrupt_handler(int irq, void *dev_id);
 void my_printk(char *string);
 
-static struct file_operations pseudo_dev_proc_operations;
-static struct proc_dir_entry *proc_entry;
-
 //read only scancode to ASCII tables
 //don't want them to be accidentally modified by kernel code
 static const char keymap[128] = "\0\e1234567890-=\177\tqwertyuiop[]\n\0asdfghjkl;'\0\\zxcvbnm,./\0*\0 \0\0\0\0\0\0\0\0\0\0\0\0\000789-456+1230.\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"; 
 static const char keymap_shift[128] = "\0\e!@#$%^&*()_+\177\tQWERTYUIOP{}\n\0ASDFGHJKL:\"~\0|ZXCVBNM<>?\0*\0 \0\0\0\0\0\0\0\0\0\0\0\0\000789-456+1230.\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
-
-static int run_cmd(char **argv){
-  //run user space helper and wait for it to finish
-  return call_usermodehelper(argv[0], argv, envp, UMH_WAIT_PROC);
-}
 
 //apparently this is a stable dev_id so that free_irq() matches request_irq()??
 static int kbd_dev_id;
@@ -81,7 +67,7 @@ static int playback_reverse = 0;
 static int __init initialization_routine(void) {
   int ret;
 
-  printk("<1> Loading module\n");
+  printk(KERN_INFO, "<1> Loading module\n");
 
   pseudo_dev_proc_operations.ioctl = pseudo_device_ioctl;
 
@@ -96,28 +82,15 @@ static int __init initialization_routine(void) {
   //proc_entry->owner = THIS_MODULE; <-- This is now deprecated
   proc_entry->proc_fops = &pseudo_dev_proc_operations;
 
-  //unload stock keyboard modules so we can use our own IRQ1 exclusively
-  {
-    char *rmmod_atkbd[] = {"/sbin/rmmod", "atkbd", NULL};
-    char *rmmod_i8042[] = {"/sbin/rmmod", "i8042", NULL};
-
-    ret = run_cmd(rmmod_atkbd);
-    if (ret)
-      printk("<1> rmmod atkbd returned %d (ok if already gone)\n", ret);
-    ret = run_cmd(rmmod_i8042);
-    if (ret)
-      printk("<1> rmmod i8042 returned %d (ok if already gone)\n", ret);
+  //claim IRQ1 (try exclusive; fall back to shared if needed)
+  ret = request_irq(1, interrupt_handler, IRQF_SHARED, "ioctl_kbd", &kbd_dev_id);
+  if (ret) {
+    printk(KERN_ERR "ioctl_module: request_irq(1) shared failed (%d)\n", ret);
+    remove_proc_entry("ioctl_test", NULL);
+    return ret;
   }
+  printk(KERN_INFO "ioctl_module: hooked IRQ1 as shared (ioctl_kbd)\n");
 
-  //registering the IRQ handler using the kernel API
-  //need to initialize the keyboard interrupt by using interrupt_hander() function
-  //request IRQ1 exclusively 
-  ret = request_irq(1, interrupt_handler, IRQF_SHARED, "keyboard_interrupt", &kbd_dev_id);
-
-  if (ret){
-    printk("<1> request_irq(1) failed %d\n", ret);
-    return ret; //invalid argument
-  }
   return 0;
 }
 
@@ -135,26 +108,9 @@ void my_printk(char *string)
 } 
 
 static void __exit cleanup_routine(void) {
-
-  int ret;
-
   printk("<1> Dumping module\n");
   //free IRQ1 first so stock driver can claim it
   free_irq(1, &kbd_dev_id);
-
-  //restore stock keyboard modules
-  {
-    char *modprobe_i8042[] = {"/sbin/modprobe", "i8042", NULL};
-    char *modprobe_atkbd[] = {"/sbin/modprobe", "atkbd", NULL};
-
-    ret = run_cmd(modprobe_i8042);
-    if (ret)
-      printk("<1> modprobe i8042 returned %d\n", ret);
-    ret = run_cmd(modprobe_atkbd);
-    if (ret)
-      printk("<1> modprobe atkbd returned %d\n", ret);
-  }
-
   remove_proc_entry("ioctl_test", NULL);
 }
 
@@ -200,7 +156,15 @@ static char translate_scancode(unsigned char scancode) {
 //keyboard interrupt handler
 static irqreturn_t interrupt_handler(int irq, void *dev_id){
   //use the scancode we got from our read_scancode function and check the values
-  unsigned char scancode;
+  unsigned char scancode, scan;
+  scan = inb(0x64);
+
+  //check if output buffer is full or data is from mouse/aux
+  if (!(scan & 0x01) || (scan & 0x20)){
+    return IRQ_NONE;
+  }
+
+  //exactly one inb(0x60)
   scancode = read_scancode();
 
   //left shift
