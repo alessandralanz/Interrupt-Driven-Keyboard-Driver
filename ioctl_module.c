@@ -45,7 +45,7 @@ void my_printk(char *string);
 
 //read only scancode to ASCII tables
 //don't want them to be accidentally modified by kernel code
-static const char keymap[128] = "\0\e1234567890-=\177\tqwertyuiop[]\n\0asdfghjkl;'\0\\zxcvbnm,./\0*\0 \0\0\0\0\0\0\0\0\0\0\0\0\000789-456+1230.\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"; 
+static const char keymap[128] = "\0\e1234567890-=\177\tqwertyuiop[]\n\0asdfghjkl;'`\0\\zxcvbnm,./\0*\0 \0\0\0\0\0\0\0\0\0\0\0\0\000789-456+1230.\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"; 
 static const char keymap_shift[128] = "\0\e!@#$%^&*()_+\177\tQWERTYUIOP{}\n\0ASDFGHJKL:\"~\0|ZXCVBNM<>?\0*\0 \0\0\0\0\0\0\0\0\0\0\0\0\000789-456+1230.\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
 
 //apparently this is a stable dev_id so that free_irq() matches request_irq()??
@@ -180,12 +180,15 @@ static void __exit cleanup_routine(void) {
   unsigned long flags;
 
   if (hijacked && kbd_desc && kbd_act) {
+    //restore the original action fields
     raw_spin_lock_irqsave(&kbd_desc->lock, flags);
     kbd_act->handler = saved_handler;
     kbd_act->dev_id = saved_dev_id;
     kbd_act->name = saved_name;
-    hijacked = 0;
     raw_spin_unlock_irqrestore(&kbd_desc->lock, flags);
+    //make sure no IRQ1s are running our interrupt handler before our module is freed
+    synchronize_irq(1);
+    hijacked = 0;
     printk(KERN_INFO "ioctl_module: restored IRQ1 action '%s'\n", saved_name ? saved_name : "(null)");
   }
   remove_proc_entry("ioctl_test", NULL);
