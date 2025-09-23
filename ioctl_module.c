@@ -27,6 +27,8 @@ struct ioctl_test_t ioc = { .character = '\0' }; //initializing the struct
 
 #define IOCTL_TEST _IOR(0, 6, struct ioctl_test_t)
 
+static inline unsigned char inb(unsigned short usPort);
+
 //function declarations 
 static int pseudo_device_ioctl(struct inode *inode, struct file *file,
 			       unsigned int cmd, unsigned long arg);
@@ -72,6 +74,9 @@ static int record_len = 0;
 static int record_mode = 0;
 static int playback_flat = 0;
 static int playback_reverse = 0;
+static int playback_mode = 0;
+static int playback_pos = 0; //next indext to emit
+static int playback_dir = 1; //+1 forward, -1 reverse
 //preprocessor event tokens sent to user space through ioc.character
 #define RECORD '\x01'
 #define PLAYBACK '\x02'
@@ -186,6 +191,18 @@ static void __exit cleanup_routine(void) {
     kbd_act->dev_id = saved_dev_id;
     kbd_act->name = saved_name;
     raw_spin_unlock_irqrestore(&kbd_desc->lock, flags);
+
+    //drain any leftover bytes so the stock handler resumes cleanly
+    {
+      int tries = 32;
+      while (tries--) {
+        unsigned char s = inb(0x64);
+        if (!(s & 0x01)) break; //output buffer empty
+        (void)inb(0x60); //read/discard data byte
+        udelay(50);
+      }
+    }
+
     //make sure no IRQ1s are running our interrupt handler before our module is freed
     synchronize_irq(1);
     hijacked = 0;
@@ -241,7 +258,7 @@ static irqreturn_t interrupt_handler(int irq, void *dev_id){
 
   //check if output buffer is full or data is from mouse/aux
   if (!(scan & 0x01) || (scan & 0x20)){
-    return IRQ_NONE;
+    return IRQ_HANDLED;
   }
 
   //exactly one inb(0x60)
@@ -269,28 +286,28 @@ static irqreturn_t interrupt_handler(int irq, void *dev_id){
   }
 
   if (left_control && (!(scancode & 0x80))){
-    //record mode: left_control + r
-    //check letter's scancode (0x13 for r) and ctrl state
-    if ((scancode & 0x7F) == 0x13){
-      if (!record_mode){
-        record_mode = 1;
-        record_len = 0;
-        playback_flat = 0;
-        playback_reverse = 0;
-        ioc.character = RECORD;
-        wake_up_interruptible(&wait_queue);
-      } 
-      return IRQ_HANDLED;
-    }
-
     //Reverse and flatten: left_control + R after left_control + r
-    if (((scancode & 0x7F) == 0x13) && (left_shift || right_shift)){
-      //check if we are already recording
-      if (record_mode){
-        playback_flat = 1;
-        playback_reverse = 1;
-        ioc.character = REVERSE;
-        wake_up_interruptible(&wait_queue);
+    //doing reverse first so that it isn't ignored by the control + r case
+    if ((scancode & 0x7F) == 0x13){
+      if (left_shift || right_shift){
+        //check if we are already recording
+        if (record_mode){
+          playback_flat = 1;
+          playback_reverse = 1;
+          ioc.character = REVERSE;
+          wake_up_interruptible(&wait_queue);
+        }
+      } else {
+        //record mode: left_control + r
+        //check letter's scancode (0x13 for r) and ctrl state
+        if (!record_mode){
+          record_mode = 1;
+          record_len = 0;
+          playback_flat = 0;
+          playback_reverse = 0;
+          ioc.character = RECORD;
+          wake_up_interruptible(&wait_queue);
+        } 
       }
       return IRQ_HANDLED;
     }
@@ -309,33 +326,17 @@ static irqreturn_t interrupt_handler(int irq, void *dev_id){
     //perform playback then clear state
     if ((scancode & 0x7F) == 0x19){
       if (record_mode){
-        int i;
         ioc.character = PLAYBACK;
         wake_up_interruptible(&wait_queue);
 
+        playback_mode = 1;
         if (playback_reverse) {
-          for (i = record_len - 1; i >= 0; i--){
-            char out = record_buffer[i];
-            if (out == '\n') {
-              out = ' ';
-            }
-            ioc.character = out;
-            wake_up_interruptible(&wait_queue);
-          }
+          playback_dir = -1;
+          playback_pos = (record_len > 0) ? (record_len - 1) : -1;
         } else {
-          for (i = 0; i < record_len; ++i){
-            char out = record_buffer[i];
-            if (playback_flat && out == '\n') {
-              out = ' ';
-            }
-            ioc.character = out;
-            wake_up_interruptible(&wait_queue);
-          }
+          playback_dir = +1;
+          playback_pos = 0;
         }
-        record_mode = 0;
-        record_len = 0;
-        playback_flat = 0;
-        playback_reverse = 0;
       }
       return IRQ_HANDLED;
     }
@@ -363,7 +364,7 @@ static irqreturn_t interrupt_handler(int irq, void *dev_id){
       }
     }
   }
-  return IRQ_HANDLED; //irq handled
+  return IRQ_HANDLED;
 }
 
 
@@ -379,6 +380,26 @@ static int pseudo_device_ioctl(struct inode *inode, struct file *file,
 
   case IOCTL_TEST: {
     int ret;
+
+    //if no pending char and playback is armed, produce next byte
+    if (ioc.character == '\0' && playback_mode) {
+      if (playback_pos >= 0 && playback_pos < record_len) {
+        char out = record_buffer[playback_pos];
+        if (playback_flat && out == '\n') out = ' ';
+        ioc.character = out;
+
+        //advance to the next ioctl
+        playback_pos += playback_dir;
+      } else {
+        //if finished streaming clean up playback/record state
+        playback_mode = 0;
+        record_mode = 0;
+        record_len = 0;
+        playback_flat = 0;
+        playback_reverse = 0;
+      }
+    }
+
     //wait until there is a new character
     //macro that puts a process to sleep until specification is met or we receive a signal
     //takes in a wait queue and a condition (not white space)
@@ -393,6 +414,16 @@ static int pseudo_device_ioctl(struct inode *inode, struct file *file,
 
     //need to reset ioc so that we do not continuously send the same character over and over unless it is being pressed
     ioc.character = '\0';
+
+    //if we just delivered the last byte then we reset all playback and recording states
+    if (playback_mode && (playback_pos < 0 || playback_pos >= record_len)) {
+      playback_mode = 0;
+      record_mode = 0;
+      record_len = 0;
+      playback_flat = 0;
+      playback_reverse = 0;
+    }
+
     break;
   }
   
