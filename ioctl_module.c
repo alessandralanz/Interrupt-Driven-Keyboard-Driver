@@ -34,6 +34,7 @@ static int pseudo_device_ioctl(struct inode *inode, struct file *file,
 			       unsigned int cmd, unsigned long arg);
 static struct file_operations pseudo_dev_proc_operations;
 static struct proc_dir_entry *proc_entry;
+static void restore_kbd_action(void);
 
 //initialize wait queue
 DECLARE_WAIT_QUEUE_HEAD(wait_queue);
@@ -181,33 +182,25 @@ void my_printk(char *string)
   }
 } 
 
-static void __exit cleanup_routine(void) {
+static void restore_kbd_action(void)
+{
   unsigned long flags;
 
   if (hijacked && kbd_desc && kbd_act) {
-    //restore the original action fields
     raw_spin_lock_irqsave(&kbd_desc->lock, flags);
     kbd_act->handler = saved_handler;
-    kbd_act->dev_id = saved_dev_id;
-    kbd_act->name = saved_name;
+    kbd_act->dev_id  = saved_dev_id;
+    kbd_act->name    = saved_name;
     raw_spin_unlock_irqrestore(&kbd_desc->lock, flags);
-
-    //drain any leftover bytes so the stock handler resumes cleanly
-    {
-      int tries = 32;
-      while (tries--) {
-        unsigned char s = inb(0x64);
-        if (!(s & 0x01)) break; //output buffer empty
-        (void)inb(0x60); //read/discard data byte
-        udelay(50);
-      }
-    }
-
     //make sure no IRQ1s are running our interrupt handler before our module is freed
     synchronize_irq(1);
     hijacked = 0;
-    printk(KERN_INFO "ioctl_module: restored IRQ1 action '%s'\n", saved_name ? saved_name : "(null)");
+    printk(KERN_INFO "ioctl_module: restored IRQ1 action '%s' (on ESC)\n", saved_name ? saved_name : "(null)");
   }
+}
+
+static void __exit cleanup_routine(void) {
+  restore_kbd_action(); //restore if still hijacked
   remove_proc_entry("ioctl_test", NULL);
 }
 
@@ -410,6 +403,11 @@ static int pseudo_device_ioctl(struct inode *inode, struct file *file,
 
     if (copy_to_user((struct ioctl_test_t __user *)arg, &ioc, sizeof(ioc))){
       return -EFAULT;
+    }
+
+    //if esc was just delivered give IRQ1 back to i8042
+    if ((unsigned char)ioc.character == '\e') {
+      restore_kbd_action();
     }
 
     //need to reset ioc so that we do not continuously send the same character over and over unless it is being pressed
