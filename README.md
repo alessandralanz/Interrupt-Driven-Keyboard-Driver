@@ -66,3 +66,4 @@ When finished run `rmmod ioctl_module` to unload the module. This can be checked
 - [Bootlin: Linux v2.6.33.3 Source Code](https://elixir.bootlin.com/linux/v2.6.33.3/source)
 - [The Linux Kernel Module Programming Guide, Chapter 12](https://tldp.org/LDP/lkmpg/2.4/html/x1210.html)
 - [The Linux Kernel Module Programming Guide, Chapter 2](https://tldp.org/LDP/lkmpg/2.6/html/x351.html#AEN374)
+- [Kernel Probes (Kprobes)](https://docs.kernel.org/trace/kprobes.html)

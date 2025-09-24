@@ -18,12 +18,14 @@
 
 MODULE_LICENSE("GPL");
 
+//userspace asks for one char at a time using ioctl_test
+//we stash the next char/event in ioc.characer and wake up user spcae when it becomes available
 /* attribute structures */
 struct ioctl_test_t {
   //int field1; //don't need
   char character;
 };
-struct ioctl_test_t ioc = { .character = '\0' }; //initializing the struct 
+struct ioctl_test_t ioc = { .character = '\0' }; //initializing the struct (\0 means no char pending)
 
 #define IOCTL_TEST _IOR(0, 6, struct ioctl_test_t)
 
@@ -34,7 +36,7 @@ static int pseudo_device_ioctl(struct inode *inode, struct file *file,
 			       unsigned int cmd, unsigned long arg);
 static struct file_operations pseudo_dev_proc_operations;
 static struct proc_dir_entry *proc_entry;
-static void restore_kbd_action(void);
+static void restore_kbd_action(void); //put stock handler back on esc
 
 //initialize wait queue
 DECLARE_WAIT_QUEUE_HEAD(wait_queue);
@@ -43,8 +45,8 @@ DECLARE_WAIT_QUEUE_HEAD(wait_queue);
 //limits the visibility of the function to the current file
 //int irq: interrupt number being handled
 //void *dev_id: pointer to a device specific identifier
-static irqreturn_t interrupt_handler(int irq, void *dev_id);
-void my_printk(char *string);
+static irqreturn_t interrupt_handler(int irq, void *dev_id); //hijack IRQ1 and replaces the i8042 handler with ours
+void my_printk(char *string); 
 
 //read only scancode to ASCII tables
 //don't want them to be accidentally modified by kernel code
@@ -54,13 +56,14 @@ static const char keymap_shift[128] = "\0\e!@#$%^&*()_+\177\tQWERTYUIOP{}\n\0ASD
 //apparently this is a stable dev_id so that free_irq() matches request_irq()??
 static int kbd_dev_id;
 
+//get irq_to_desc by using kprobe so we can get irq_desc for IRQ1 and then swap
 struct irq_desc;
 struct irqaction;
 static struct irq_desc *(*p_irq_to_desc)(unsigned int);
 //keeping what we overwrite so we can restore it
-static struct irq_desc *kbd_desc;
-static struct irqaction *kbd_act;
-static irq_handler_t saved_handler;
+static struct irq_desc *kbd_desc; //IRQ1 description
+static struct irqaction *kbd_act; //action we hijack
+static irq_handler_t saved_handler; //original handler for reinstantiation upon module removal
 static void *saved_dev_id;
 static const char *saved_name;
 static int hijacked;
@@ -89,6 +92,7 @@ static int __init initialization_routine(void) {
   int ret;
   unsigned long flags;
   struct irqaction *act;
+  //find the function address that corresponds to the symbol
   struct kprobe kp = {
     .symbol_name = "irq_to_desc",
   };
@@ -111,16 +115,19 @@ static int __init initialization_routine(void) {
   //5 sec pause so any pending/ buffered keystrokes are handled by the stock handler before we hijack IRQ1
   msleep(5000); 
 
-  //use kprobe for irq_to_desc
-  ret = register_kprobe(&kp);
+  //fetch IRQ1's irq_desc, find the i8042 irqaction, and swap handler with our interrupt_handler under descriptor lock
+  //use kprobe for irq_to_desc to find the address
+  //bc we are dealing with a non exported function we create a kprobe 
+  ret = register_kprobe(&kp); //makes the kernel look up the symbol by name and install a probe at that address (kp.addr contains address of irq_to_desc)
   if (ret) {
     printk(KERN_ERR "ioctl_module: kprobe resolve irq_to_desc failed: %d\n", ret);
     remove_proc_entry("ioctl_test", NULL);
     return -ENOENT;
   }
-  p_irq_to_desc = (void *)kp.addr;
-  unregister_kprobe(&kp);
+  p_irq_to_desc = (void *)kp.addr; //cast kp.addr so we can call it like a normal function
+  unregister_kprobe(&kp); //immediately unregister the kprobe so we don't trap execution bc all we want is the address
 
+  //incase we fail we print an error and clean the proc file
   if (!p_irq_to_desc) {
     printk(KERN_ERR "ioctl_module: irq_to_desc address null\n");
     remove_proc_entry("ioctl_test", NULL);
@@ -135,7 +142,7 @@ static int __init initialization_routine(void) {
     return -ENODEV;
   }
 
-  //find i8042 action on IRQ1
+  //find i8042 action on IRQ1 or fallback
   act = kbd_desc->action;
   while (act && (!act->name || !(strstr(act->name, "i8042")))) {
     act = act->next;
@@ -151,7 +158,7 @@ static int __init initialization_routine(void) {
     printk(KERN_WARNING "ioctl_module: i8042 action not found; hijacking first action named '%s'\n", act->name ? act->name : "(null)");
   }
 
-  //swap the handler under the desc lock
+  //swap the handler under the irq_desc lock
   raw_spin_lock_irqsave(&kbd_desc->lock, flags);
 
   kbd_act = act;
@@ -159,7 +166,7 @@ static int __init initialization_routine(void) {
   saved_dev_id = act->dev_id;
   saved_name = act->name;
 
-  act->handler = interrupt_handler;
+  act->handler = interrupt_handler; //our handler now receives IRQ1
   act->dev_id = &kbd_dev_id;
   act->name = "ioctl_kbd";
   hijacked = 1;
@@ -182,6 +189,7 @@ void my_printk(char *string)
   }
 } 
 
+//put the original i8042 handler back on IRQ1
 static void restore_kbd_action(void)
 {
   unsigned long flags;
@@ -199,6 +207,7 @@ static void restore_kbd_action(void)
   }
 }
 
+//on module unload we restore the handler
 static void __exit cleanup_routine(void) {
   restore_kbd_action(); //restore if still hijacked
   remove_proc_entry("ioctl_test", NULL);
@@ -244,6 +253,11 @@ static char translate_scancode(unsigned char scancode) {
 }
 
 //keyboard interrupt handler
+//check the keyboard controller status (port 0x64) bc need to make sure the output buffer isn't full and filter out AUX
+//read one byte from 0x60 and deliver one character/event to user space through ioc.character and wakeup
+//if any of the events happen toggle modes and wake userspace with a mode token byte
+//if make code and printable convert using keymap or keymap_shift
+//if record mode is on buffer into record_buffer otherwise set ioc.character = ch and wake up the wait queue
 static irqreturn_t interrupt_handler(int irq, void *dev_id){
   //use the scancode we got from our read_scancode function and check the values
   unsigned char scancode, scan;
@@ -254,7 +268,7 @@ static irqreturn_t interrupt_handler(int irq, void *dev_id){
     return IRQ_HANDLED;
   }
 
-  //exactly one inb(0x60)
+  //exactly one inb(0x60) per IRQ to avoid draining extra bytes
   scancode = read_scancode();
 
   //left shift
@@ -325,6 +339,9 @@ static irqreturn_t interrupt_handler(int irq, void *dev_id){
         playback_mode = 1;
         if (playback_reverse) {
           playback_dir = -1;
+          //check if the record buffer has characters
+          //if so we start at the last character in the buffer (bc we're replaying backwards)
+          //if there's nothing in the buffer the playback loop stops
           playback_pos = (record_len > 0) ? (record_len - 1) : -1;
         } else {
           playback_dir = +1;
@@ -342,8 +359,6 @@ static irqreturn_t interrupt_handler(int irq, void *dev_id){
       //buffer only and save for playback
       //we do not want to emit while recording
       if (record_mode){
-        //skip backspace during recording? 
-        //idk instructions say to not worry about embedded modifier sequences
         //prevent buffer overflow; if full drop extra chars
         if (ch != '\b' && record_len < (int)sizeof(record_buffer)){
           record_buffer[record_len++] = ch;
@@ -401,6 +416,7 @@ static int pseudo_device_ioctl(struct inode *inode, struct file *file,
      return ret;
     }
 
+    //copy the single byte or event to userspace
     if (copy_to_user((struct ioctl_test_t __user *)arg, &ioc, sizeof(ioc))){
       return -EFAULT;
     }

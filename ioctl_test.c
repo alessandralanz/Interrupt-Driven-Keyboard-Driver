@@ -28,15 +28,17 @@ static void erase(void){
   fflush(stdout); //flush to make sure the erase sequence is written right away
 }
 
-//calls ioctl() to ask the kernel driver for the next available character/event
-//sleeps until the kernel wakes us when a key is pressed
+//calls ioctl() to ask the kernel driver for the next available character/event (fetches one byte)
+//sleeps until the kernel wakes up when a key is pressed
 //returns that char as an int which is later casted to unsigned char for printing
 static int my_getchar(int fd) {
   struct ioctl_test_t msg = { .character = '\0' };
+  //sleeps in the kernel until ioc.character != \0 and then copies that byte back into msg.character
   if (ioctl(fd, IOCTL_TEST, &msg) < 0) {
      return -1;
   }
-  return (unsigned char)msg.character;
+  //cast so that keycodes or event tokens with the high bit set dont turn into negative numbers when passed as an int
+  return (unsigned char)msg.character; 
 }
 
 int main (void) {
@@ -46,7 +48,7 @@ int main (void) {
     return 1;
   }
 
-  //wait for one byte per ioctl
+  //repeatedly call my_getchar(fd): each call returns one byte (printable char or event token)
   //kernel wakes up when a char or event is ready
   while (1) {
     //block until kernel driver delivers a char
@@ -56,6 +58,8 @@ int main (void) {
       break;
     }
 
+    //converts our return value from my_getchar() into an unsigned char so we can compare it to control keys and tokens 
+    //ensures the byte we're interpreting is what the kernel sent
     unsigned char character = (unsigned char) ch;
     if (ESC(character)){
       break; //exit on esc and restore IRQ1
@@ -83,6 +87,7 @@ int main (void) {
       continue; 
     }
 
+    //normal printable characters
     //writes the single char to stdout (the terminal)
     putchar(character);
     //forces any buffered output to appear immediately
