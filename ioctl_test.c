@@ -14,6 +14,7 @@ struct ioctl_test_t {
 struct ioctl_test_t ioc = { .character = '\0' };
 
 #define IOCTL_TEST _IOR(0, 6, struct ioctl_test_t)
+//event tokens from ioc.character
 #define RECORD(character) ((character) == '\x01')
 #define PLAYBACK(character) ((character) == '\x02')
 #define FLATTEN(character) ((character) == '\x03')
@@ -21,9 +22,21 @@ struct ioctl_test_t ioc = { .character = '\0' };
 #define ESC(character) ((unsigned char)(character) == '\e')
 #define BACKSPACE(character) ((character) == '\b')
 
+//backspace + space + backspace results in the erasure of one char on the terminal
 static void erase(void){
   fputs("\b \b", stdout);
-  fflush(stdout);
+  fflush(stdout); //flush to make sure the erase sequence is written right away
+}
+
+//calls ioctl() to ask the kernel driver for the next available character/event
+//sleeps until the kernel wakes us when a key is pressed
+//returns that char as an int which is later casted to unsigned char for printing
+static int my_getchar(int fd) {
+  struct ioctl_test_t msg = { .character = '\0' };
+  if (ioctl(fd, IOCTL_TEST, &msg) < 0) {
+     return -1;
+  }
+  return (unsigned char)msg.character;
 }
 
 int main (void) {
@@ -35,21 +48,24 @@ int main (void) {
 
   //wait for one byte per ioctl
   //kernel wakes up when a char or event is ready
-  while (1){
-    struct ioctl_test_t message;
-    if (ioctl(fd, IOCTL_TEST, &message)) {
-      perror("ioctl IOCTL_TEST");
+  while (1) {
+    //block until kernel driver delivers a char
+    int ch = my_getchar(fd);
+    if (ch < 0) {
+      perror("my_getchar");
       break;
     }
-    unsigned char character = (unsigned char)message.character;
+
+    unsigned char character = (unsigned char) ch;
     if (ESC(character)){
-      break;
+      break; //exit on esc and restore IRQ1
     }
     if (BACKSPACE(character)){
       erase();
       continue;
     }
 
+    //log for bonus events
     if (RECORD(character)){
       fprintf(stderr, "[record start]\n"); 
       continue; 
@@ -67,7 +83,9 @@ int main (void) {
       continue; 
     }
 
+    //writes the single char to stdout (the terminal)
     putchar(character);
+    //forces any buffered output to appear immediately
     fflush(stdout);
   }
 
