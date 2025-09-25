@@ -53,7 +53,7 @@ The user test program:
 Press **ESC** to exit. When ESC is pressed the driver will also restore control of IRQ1 back to the stock Linux keyboard handler. This can be verified by looking at `cat /proc/interrupts` which should display i8042 handling IRQ1.
 
 ### 4. Remove the kernel module
-When finished run `rmmod ioctl_module` to unload the module. This can be checked by running `lsmod` which should show no modules.
+When finished run `rmmod ioctl_module` to unload the module. This can be checked by running `lsmod` which should show no modules
 
 ## Sources
 - [OS Primer Writeup](https://www.cs.bu.edu/fac/richwest/cs552_fall_2025/assignments/primer/primer.html)
