@@ -52,8 +52,6 @@ void my_printk(char *string);
 //don't want them to be accidentally modified by kernel code
 static const char keymap[128] = "\0\e1234567890-=\177\tqwertyuiop[]\n\0asdfghjkl;'`\0\\zxcvbnm,./\0*\0 \0\0\0\0\0\0\0\0\0\0\0\0\000789-456+1230.\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"; 
 static const char keymap_shift[128] = "\0\e!@#$%^&*()_+\177\tQWERTYUIOP{}\n\0ASDFGHJKL:\"~\0|ZXCVBNM<>?\0*\0 \0\0\0\0\0\0\0\0\0\0\0\0\000789-456+1230.\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
-
-//apparently this is a stable dev_id so that free_irq() matches request_irq()??
 static int kbd_dev_id;
 
 //get irq_to_desc by using kprobe so we can get irq_desc for IRQ1 and then swap
@@ -93,6 +91,7 @@ static int __init initialization_routine(void) {
   unsigned long flags;
   struct irqaction *act;
   //find the function address that corresponds to the symbol
+  //use kprobe to resolve the non-exported irq_to_desc() address and then call it to get the irq_desc for IRQ1
   struct kprobe kp = {
     .symbol_name = "irq_to_desc",
   };
@@ -142,7 +141,7 @@ static int __init initialization_routine(void) {
     return -ENODEV;
   }
 
-  //find i8042 action on IRQ1 or fallback
+  //linked list to find i8042 action on IRQ1 or first action if we don't find the name
   act = kbd_desc->action;
   while (act && (!act->name || !(strstr(act->name, "i8042")))) {
     act = act->next;
@@ -194,11 +193,12 @@ static void restore_kbd_action(void)
 {
   unsigned long flags;
 
+  //check kbd_desc and kbd_act so we know that we have a valid IRQ descriptor and we know which action we overwrote
   if (hijacked && kbd_desc && kbd_act) {
     raw_spin_lock_irqsave(&kbd_desc->lock, flags);
     kbd_act->handler = saved_handler;
-    kbd_act->dev_id  = saved_dev_id;
-    kbd_act->name    = saved_name;
+    kbd_act->dev_id = saved_dev_id;
+    kbd_act->name = saved_name;
     raw_spin_unlock_irqrestore(&kbd_desc->lock, flags);
     //make sure no IRQ1s are running our interrupt handler before our module is freed
     synchronize_irq(1);
@@ -221,8 +221,9 @@ static inline unsigned char inb( unsigned short usPort ) {
     return uch;
 }
 
-//get scancode from the keyboard at data port 0x60
+//get scancode from the keyboard at data port 0x60 in ISR after verifying 0x64 status
 //can read with inb
+//read one at a time so that we don't drain multiple bytes that belogn to following interrupts
 unsigned char read_scancode(void){
   unsigned char scancode = inb(0x60);
   return scancode;
@@ -242,7 +243,8 @@ static char translate_scancode(unsigned char scancode) {
   //`& 0x7F` clears the top bit giving us the base index to match our 128 entry lookup table 
   index = scancode & 0x7F; 
 
-  //backspace 
+  //backspace
+  //return \b to user space 
   if (index == 0x0E){
     return '\b'; //use this or return keymap[index]??
   }
@@ -263,9 +265,9 @@ static irqreturn_t interrupt_handler(int irq, void *dev_id){
   unsigned char scancode, scan;
   scan = inb(0x64);
 
-  //check if output buffer is full or data is from mouse/aux
+  //check if output buffer = 0 or data is from mouse/aux
   if (!(scan & 0x01) || (scan & 0x20)){
-    return IRQ_HANDLED;
+    return IRQ_HANDLED; //not ours
   }
 
   //exactly one inb(0x60) per IRQ to avoid draining extra bytes
@@ -383,7 +385,7 @@ static irqreturn_t interrupt_handler(int irq, void *dev_id){
 static int pseudo_device_ioctl(struct inode *inode, struct file *file,
 				unsigned int cmd, unsigned long arg)
 {
-  
+  //returns one byte/event to the user space per call 
   switch (cmd){
 
   case IOCTL_TEST: {
@@ -391,12 +393,15 @@ static int pseudo_device_ioctl(struct inode *inode, struct file *file,
 
     //if no pending char and playback is armed, produce next byte
     if (ioc.character == '\0' && playback_mode) {
+      //check that we are still in the buffer
       if (playback_pos >= 0 && playback_pos < record_len) {
         char out = record_buffer[playback_pos];
-        if (playback_flat && out == '\n') out = ' ';
+        if (playback_flat && out == '\n') {
+          out = ' ';
+        }
         ioc.character = out;
 
-        //advance to the next ioctl
+        //advance to the next ioctl (the next index)
         playback_pos += playback_dir;
       } else {
         //if finished streaming clean up playback/record state
